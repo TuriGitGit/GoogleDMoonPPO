@@ -1,2 +1,2 @@
-# GoogleDMoonPPO
+# Sudoku
 PPO Plays Sudoku
