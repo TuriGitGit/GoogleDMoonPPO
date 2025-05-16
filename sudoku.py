@@ -231,14 +231,10 @@ sweep_config = {
     "goal": "minimize"
   },
   "parameters": {
-    "gamma": {
-      "values": [0.9, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 0.999]
-    },
-    "epochs": {
-      "values": [1, 3, 5, 7, 9]
-    },
-    "batchSize": {
-      "values": [2**12, 2**13, 2**14, 2**15, 2**16, 2**17]
+      "lr": {
+      "distribution": "uniform",
+      "min": 0.0001,
+      "max": 0.002
     },
     "entCoef": {
       "distribution": "uniform",
@@ -250,19 +246,23 @@ sweep_config = {
       "min": 0.1,
       "max": 0.9
     },
+    "epochs": {
+      "values": [1, 3, 5, 7]
+    },
     "clipEpsilon": {
-      "values": [0.03, 0.06, 0.09, 0.12, 0.15]
+      "values": [0.07, 0.11, 0.15]
     },
     "gradClip": {
       "values": [0.3, 0.4, 0.5, 0.6, 0.7]
     },
-    "memory": {
-      "values": [2**13, 2**14, 2**15, 2**16, 2**17, 2**18, 2**19, 2**20]
+    "gamma": {
+      "values": [0.93, 0.96, 0.98, 0.99, 0.999]
     },
-    "lr": {
-      "distribution": "uniform",
-      "min": 0.00003,
-      "max": 0.002
+    "batchSize": {
+      "values": [2**13, 2**14, 2**15, 2**16]
+    },
+    "memory": {
+      "values": [2**14, 2**15, 2**16, 2**17, 2**18]
     }
   }
 }
