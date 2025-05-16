@@ -170,11 +170,11 @@ def genSudoku(hints):
         if pos is None:
             return True
         row, col = pos
-        numbers = list(range(1, 10))
+        numbers = list(range(9))
         random.shuffle(numbers)
         for num in numbers:
-            if canPlace(grid, row, col, num):
-                grid[row][col] = num
+            if canPlace(grid, row, col, 1+num):
+                grid[row][col] = 1+num
                 if fillGrid(grid):
                     return True
                 grid[row][col] = 0
@@ -183,7 +183,8 @@ def genSudoku(hints):
     def countSolutions(grid):
         tempGrid = copy.copy(grid)
         solutions = 0
-        def solve(solutions, tempGrid):
+        def solve():
+            nonlocal solutions, tempGrid
             if solutions > 1:
                 return
             pos = findEmpty(tempGrid)
@@ -194,12 +195,13 @@ def genSudoku(hints):
             for num in range(9):
                 if canPlace(tempGrid, row, col, num+1):
                     tempGrid[row][col] = num+1
-                    solve(solutions, tempGrid)
+                    solve()
                     tempGrid[row][col] = 0
-        solve(solutions, tempGrid)
+        solve()
         return solutions
 
-    def removeNumbers(grid, n):
+    def removeNumbers(grid, n=1):
+        """removes n numbers from the grid and returns the edited grid"""
         positions = [(i, j) for i in range(9) for j in range(9)]
         random.shuffle(positions)
         removed = 0
@@ -208,8 +210,7 @@ def genSudoku(hints):
             row, col = pos
             backup = grid[row][col]
             grid[row][col] = 0
-            grid_copy = copy.deepcopy(grid)
-            num_solutions = countSolutions(grid_copy)
+            num_solutions = countSolutions(grid)
             if num_solutions == 1:
                 removed += 1
             else:
@@ -220,7 +221,6 @@ def genSudoku(hints):
     grid = np.zeros((9,9), dtype=int)
     fillGrid(grid)
     grid = removeNumbers(grid, hints)
-    print(grid)
     return grid
 
 # Define sweep configuration
@@ -285,7 +285,6 @@ def train():
             random.seed(sol)
             grid = genSudoku(hints)
             base = copy.copy(grid)
-            print(base)
             solved = False
             attempts = 0
             while not solved:
@@ -326,7 +325,6 @@ def train():
                     agent.train()
                     state = next_state
                     score += reward
-                    print(score)
 
             hints -= 1
             wandb.log({"score": score})
