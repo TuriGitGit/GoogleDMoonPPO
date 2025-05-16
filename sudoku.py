@@ -1,10 +1,15 @@
 import random
 import copy
 import numpy as np
+import time
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
 from collections import deque
+
+import wandb
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using: {device}")
@@ -25,25 +30,26 @@ class PPOActorCritic(nn.Module):
     def forward(self, x):
         for layer in self.hidden_layers:
             x = self.activation(layer(x))
-
         action_logits = self.actor(x)
         value = self.critic(x)
         return action_logits, value
     
 class PPOAgent:
-    def __init__(self, input_dim, action_dim):
+    def __init__(self, input_dim, action_dim, gamma=0.99, epochs=3,
+                  batchSize=32768, lr=0.0001, clipEpsilon=0.1, entCoef=0.05,
+                  valCoef=0.5, memory=10000, gradClip=0.5):
         self.action_dim = action_dim
-        self.gamma = 0.99
+        self.gamma = gamma
         self.temperature = 0
-        self.clipEpsilon = 0.1
-        self.entCoef = 0.04
-        self.valCoef = 0.5
-        self.gradClip = 1.0
-        self.epochs = 3
-        self.batchSize = 2**15
-        self.memory = deque(maxlen=50000)
+        self.clipEpsilon = clipEpsilon
+        self.entCoef = entCoef
+        self.valCoef = valCoef
+        self.gradClip = gradClip
+        self.epochs = epochs
+        self.batchSize = batchSize
+        self.memory = deque(maxlen=memory)
         self.network = PPOActorCritic(input_dim, action_dim).to(device)
-        self.optimizer = optim.AdamW(self.network.parameters(), lr=0.0001)
+        self.optimizer = optim.AdamW(self.network.parameters(), lr=lr)
         self.steps = 0
 
     def softMax(self, value, dim=-1):
@@ -52,11 +58,9 @@ class PPOAgent:
         else:
             return torch.softmax(value, dim=dim)
 
-
-    def tupleAction(self, action_idx):
-        """Convert action index (0-728) to tuple (i, j, value)."""
-        i = action_idx // 81
-        remainder = action_idx % 81
+    def tupleAction(self, actionID):
+        i = actionID // 81
+        remainder = actionID % 81
         j = remainder // 9
         value = (remainder % 9) + 1
         return i, j, value
@@ -71,29 +75,24 @@ class PPOAgent:
                     i, j, value = self.tupleAction(idx)
                     if grid[i][j] != 0 or not isValid(grid, i, j, value):
                         mask[idx] = 0
-
-                action_logits = action_logits.masked_fill(mask == 0, -999999)
-
+                action_logits = action_logits.masked_fill(mask == 0, -999_999)
             probs = self.softMax(action_logits)
-            action_idx = torch.multinomial(probs, 1).item()
-            return self.tupleAction(action_idx)
+            actionID = torch.multinomial(probs, 1).item()
+            return self.tupleAction(actionID)
 
-    def remember(self, state, action_idx, reward, next_state, done):
+    def remember(self, state, actionID, reward, next_state, done):
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
         with torch.no_grad():
             action_logits, value = self.network(state_tensor)
             probs = self.softMax(action_logits)
-            log_prob = torch.log(probs[0, action_idx] + 1e-8)
-
-        self.memory.append((state_tensor, action_idx, reward, next_state, done, log_prob, value))
+            log_prob = torch.log(probs[0, actionID] + 1e-8)
+        self.memory.append((state_tensor, actionID, reward, next_state, done, log_prob, value))
 
     def train(self):
         if len(self.memory) < self.batchSize:
             return
-
         batch = random.sample(self.memory, min(len(self.memory), self.batchSize))
         states, actions, rewards, next_states, dones, old_log_probs, old_values = zip(*batch)
-
         states = torch.cat(states).to(device)
         actions = torch.tensor(actions, dtype=torch.long).to(device)
         rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
@@ -101,22 +100,16 @@ class PPOAgent:
         dones = torch.tensor(dones, dtype=torch.float32).to(device)
         old_log_probs = torch.stack(old_log_probs).to(device)
         old_values = torch.cat(old_values).squeeze().to(device)
-
         if next_states.nelement() > 0:
             with torch.no_grad():
                 _, next_values = self.network(next_states)
-
             returns = rewards + self.gamma * next_values.squeeze() * (1 - dones)
-
         else:
             returns = rewards
-
         returns = returns.detach()
-
         advantages = returns - old_values
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         advantages = advantages.detach()
-
         total_loss = 0.0
         for epoch in range(self.epochs):
             self.optimizer.zero_grad()
@@ -124,88 +117,20 @@ class PPOAgent:
             probs = self.softMax(action_logits)
             log_probs = torch.log(probs + 1e-8)
             dist_entropy = -(log_probs * probs).sum(-1).mean()
-
             new_log_prob = log_probs[range(self.batchSize), actions]
             ratio = torch.exp(new_log_prob - old_log_probs)
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1 - self.clipEpsilon, 1 + self.clipEpsilon) * advantages
             policy_loss = -torch.min(surr1, surr2).mean()
-
             value_loss = nn.MSELoss()(values.squeeze(), returns)
             loss = policy_loss - self.entCoef * dist_entropy + self.valCoef * value_loss
             total_loss += loss.item()
-
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=self.gradClip)
             self.optimizer.step()
             self.steps += 1
-
         self.memory.clear()
 
-
-def createGrid(hints):
-    grid = np.zeros((9, 9), dtype=int)
-    slots = []
-    for _ in range(hints):
-        n = random.randint(0, 8)
-        m = random.randint(0, 8)
-        if [n, m] not in slots:
-            slots.append([n, m])
-            grid[n][m] = random.randint(1, 9)
-
-    return grid
-
-def hasSol(grid):
-    row_used = [0] * 9
-    col_used = [0] * 9
-    box_used = [0] * 9
-    
-    for i in range(9):
-        for j in range(9):
-            if grid[i][j] != 0:
-                num = grid[i][j] - 1
-                mask = 1 << num
-                box_index = (i // 3) * 3 + (j // 3)
-                if (row_used[i] & mask) or (col_used[j] & mask) or (box_used[box_index] & mask):
-                    return False
-                
-                row_used[i] |= mask
-                col_used[j] |= mask
-                box_used[box_index] |= mask
-    
-    empty_cells = [(i, j) for i in range(9) for j in range(9) if grid[i][j] == 0]
-    
-    def backtrack(index):
-        if index == len(empty_cells):
-            return True
-        
-        i, j = empty_cells[index]
-        box_index = (i // 3) * 3 + (j // 3)
-        for num in range(1, 10):
-            mask = 1 << (num - 1)
-            if not (row_used[i] & mask) and not (col_used[j] & mask) and not (box_used[box_index] & mask):
-                grid[i][j] = num
-                row_used[i] |= mask
-                col_used[j] |= mask
-                box_used[box_index] |= mask
-                if backtrack(index + 1):
-                    return True
-                
-                grid[i][j] = 0
-                row_used[i] &= ~mask
-                col_used[j] &= ~mask
-                box_used[box_index] &= ~mask
-
-        return False
-    
-    return backtrack(0)
-
-def createSolveable(lower, upper):
-    while True:
-        grid = createGrid(random.randint(lower, upper))
-        q = hasSol(grid)
-        if q:
-            return grid
 
 def getState(grid, base):
     return np.array([grid, base]).flatten()
@@ -213,53 +138,24 @@ def getState(grid, base):
 def isValid(grid, i, j, value):
     if value in grid[i, :] or value in grid[:, j]:
         return False
-    
-    box_row, box_col = 3 * (i // 3), 3 * (j // 3)
-    if value in grid[box_row:box_row+3, box_col:box_col+3]:
+    boxRow, boxCol = 3 * (i // 3), 3 * (j // 3)
+    if value in grid[boxRow:boxRow+3, boxCol:boxCol+3]:
         return False
-    
     return True
 
-def evaluate(agent, num_tests=10):
-    successes = 0
-    for _ in range(num_tests):
-        grid, solved = createSolveable()
-        state = getState(grid, base)
-        done = False
-        while not done:
-            i, j, value = agent.act(state, base)
-            if grid[i][j] == 0:
-                grid[i][j] = value
-                state = getState(grid, base)
-                if np.array_equal(grid, solved):
-                    successes += 1
-                    break
-
-            else:
-                break
-
-    return successes / num_tests
-
-
-def genSudoku(lower, upper):
-    if lower < 0 or upper > 81 or lower > upper:
-        raise ValueError("Invalid range for starting numbers")
-    
+def genSudoku(hints):
     def canPlace(grid, row, col, num):
         if num in grid[row]:
             return False
-        
         for i in range(9):
             if grid[i][col] == num:
                 return False
-            
-        box_row = (row // 3) * 3
-        box_col = (col // 3) * 3
+        boxRow = (row // 3) * 3
+        boxCol = (col // 3) * 3
         for i in range(3):
             for j in range(3):
-                if grid[box_row + i][box_col + j] == num:
+                if grid[boxRow + i][boxCol + j] == num:
                     return False
-                
         return True
 
     def findEmpty(grid):
@@ -267,14 +163,12 @@ def genSudoku(lower, upper):
             for j in range(9):
                 if grid[i][j] == 0:
                     return i, j
-                
         return None
 
     def fillGrid(grid):
         pos = findEmpty(grid)
         if pos is None:
             return True
-        
         row, col = pos
         numbers = list(range(1, 10))
         random.shuffle(numbers)
@@ -283,118 +177,161 @@ def genSudoku(lower, upper):
                 grid[row][col] = num
                 if fillGrid(grid):
                     return True
-                
                 grid[row][col] = 0
-
         return False
 
     def countSolutions(grid):
-        grid_copy = [row[:] for row in grid]
+        tempGrid = copy.copy(grid)
         solutions = 0
-        def solve():
-            nonlocal solutions, grid_copy
+        def solve(solutions, tempGrid):
             if solutions > 1:
                 return
-            
-            pos = findEmpty(grid_copy)
+            pos = findEmpty(tempGrid)
             if pos is None:
                 solutions += 1
                 return
-            
             row, col = pos
-            for num in range(1, 10):
-                if canPlace(grid_copy, row, col, num):
-                    grid_copy[row][col] = num
-                    solve()
-                    grid_copy[row][col] = 0
-
-        solve()
+            for num in range(9):
+                if canPlace(tempGrid, row, col, num+1):
+                    tempGrid[row][col] = num+1
+                    solve(solutions, tempGrid)
+                    tempGrid[row][col] = 0
+        solve(solutions, tempGrid)
         return solutions
 
-    def removeNumbers(grid, s):
-        attempts = 81 - s
+    def removeNumbers(grid, n):
         positions = [(i, j) for i in range(9) for j in range(9)]
         random.shuffle(positions)
         removed = 0
-        while removed < attempts and positions:
+        while removed < (81 - n) and positions:
             pos = positions.pop()
             row, col = pos
             backup = grid[row][col]
             grid[row][col] = 0
-            grid_copy = [row[:] for row in grid]
+            grid_copy = copy.deepcopy(grid)
             num_solutions = countSolutions(grid_copy)
             if num_solutions == 1:
                 removed += 1
-
             else:
                 grid[row][col] = backup
 
         return grid
 
-    s = random.randint(lower, upper)
-    grid = np.array([[0 for _ in range(9)] for _ in range(9)])
+    grid = np.zeros((9,9), dtype=int)
     fillGrid(grid)
-    grid = removeNumbers(grid, s)
+    grid = removeNumbers(grid, hints)
+    print(grid)
     return grid
 
-if __name__ == "__main__":
-    agent = PPOAgent(162, 729)
-    lower = 80
-    upper = 80
-    bestScore = 1
-    sols = 0
+# Define sweep configuration
+sweep_config = {
+  "method": "bayes",
+  "metric": {
+    "name": "time",
+    "goal": "minimize"
+  },
+  "parameters": {
+    "gamma": {
+      "values": [0.9, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 0.999]
+    },
+    "epochs": {
+      "values": [1, 3, 5, 7, 9]
+    },
+    "batchSize": {
+      "values": [2**12, 2**13, 2**14, 2**15, 2**16, 2**17]
+    },
+    "entCoef": {
+      "distribution": "uniform",
+      "min": 0.01,
+      "max": 0.2
+    },
+    "valCoef": {
+      "distribution": "uniform",
+      "min": 0.1,
+      "max": 0.9
+    },
+    "clipEpsilon": {
+      "values": [0.03, 0.06, 0.09, 0.12, 0.15]
+    },
+    "gradClip": {
+      "values": [0.3, 0.4, 0.5, 0.6, 0.7]
+    },
+    "memory": {
+      "values": [2**13, 2**14, 2**15, 2**16, 2**17, 2**18, 2**19, 2**20]
+    },
+    "lr": {
+      "distribution": "uniform",
+      "min": 0.00003,
+      "max": 0.002
+    }
+  }
+}
 
-    for ep in range(70):
-        random.seed(ep)
-        grid = genSudoku(lower, upper)
-        base = copy.copy(grid)
-        solved = False
-        atts = 0
-        sols += 1
-        while not solved:
-            atts += 1
-            grid = copy.copy(base)
-            state = getState(grid, base)
-            done = False
-            score = 0
-            acts = 0
+
+def train():
+    with wandb.init() as run:
+        config = wandb.config
+        agent = PPOAgent(input_dim=162, action_dim=729, gamma=config.gamma,
+                        epochs=config.epochs, batchSize=config.batchSize, lr=config.lr,
+                        entCoef=config.entCoef, valCoef=config.valCoef, clipEpsilon=config.clipEpsilon,
+                        memory=config.memory, gradClip=config.gradClip
+                        )
+        hints = 80
+        startTime = time.time()
+        #timeLimit = startTime + 180 #secs
+
+
+        for sol in range(5):
+            random.seed(sol)
+            grid = genSudoku(hints)
+            base = copy.copy(grid)
+            print(base)
+            solved = False
             attempts = 0
-            numbers = lower
+            while not solved:
+                grid = copy.copy(base)
+                state = getState(grid, base)
+                done = False
+                score = 0
+                numbers = hints
 
-            while not done:
-                i, j, value = agent.act(state, base)
-                acts += 1
-                reward = 0
+                while not done:
+                    i, j, value = agent.act(state, base)
+                    reward = 0
 
-                if base[i][j] == 0:
-                    if isValid(grid, i, j, value):
-                            grid[i][j] = value
-                            attempts = 0
-                            reward = 5 + (numbers//8)
-                            numbers += 1
-                            if numbers == 81:
-                                reward = 100
+                    if base[i][j] == 0:
+                        if isValid(grid, i, j, value):
+                                grid[i][j] = value
+                                attempts = 0
+                                reward = 5 + (numbers//8)
+                                numbers += 1
+                                if numbers == 81:
+                                    reward = 100
+                                    done = True
+                                    solved = True
+                        else:
+                            reward = -1
+                            attempts += 1
+                            if attempts >= 11:
                                 done = True
-                                solved = True
                     else:
-                        reward = -1
-                        attempts += 1
-                        if attempts >= 9:
-                            done = True
-                else:
-                    reward = -2
+                        reward = -2
 
-                if score < -999:
-                    done = True
+                    if score < -999:
+                        done = True
 
-                next_state = getState(grid, base)
-                action_idx = i * 81 + j * 9 + (value - 1)
-                agent.remember(state, action_idx, reward, next_state, done)
-                agent.train()
-                state = next_state
-                score += reward
-            print(sols)
+                    next_state = getState(grid, base)
+                    actionID = i * 81 + j * 9 + (value - 1)
+                    agent.remember(state, actionID, reward, next_state, done)
+                    agent.train()
+                    state = next_state
+                    score += reward
+                    print(score)
 
-        lower -= 1
-        upper -= 1
-        #print(-atts)
+            hints -= 1
+            wandb.log({"score": score})
+            wandb.log({"solves": sol})
+            wandb.log({"time": (np.round(time.time() - startTime))})
+
+sweep_id = wandb.sweep(sweep_config, project="sudoku_ppo")
+wandb.agent(sweep_id, train, count=50)
